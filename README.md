@@ -7,7 +7,7 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20-green.svg)](#)
 [![Agent: Antigravity](https://img.shields.io/badge/Agent-Antigravity%20Ready-purple.svg)](#)
 
-Agent Browser Linux bridges the gap between AI coding assistants and the live web on Linux. It gives AI agents direct control over a real Google Chrome instance with human-in-the-loop collaboration, persistent session logins, and numbered accessibility snapshots.
+Agent Browser Linux bridges the gap between AI coding assistants and the live web on Linux. It gives AI agents direct control over a real Google Chrome instance with human-in-the-loop collaboration, persistent session logins, visual element grounding, and full console/network observability.
 
 ---
 
@@ -18,8 +18,10 @@ Traditional browser automation for AI agents is either headless (causing bot det
 **Agent Browser Linux solves this natively for Linux:**
 - **Linux-First**: Native support for Linux desktop environments running Wayland or X11.
 - **Human-in-the-Loop Collaboration**: Chrome runs as a visible desktop window. If a 2FA prompt, CAPTCHA, or SSO check appears, the agent asks you to complete it, and picks right back up.
-- **Persistent Authentication**: Sessions and cookies are saved in `~/.config/agent-browser-linux/profile`. Log into GitHub, Google, Twitter, AWS, or your internal company portals once, and your agent stays logged in forever.
-- **Numbered DOM Snapshots**: Converts pages into an interactive map (`[@1]`, `[@2]`, `[@3]`) so agents can click, fill, and navigate deterministically.
+- **Persistent Authentication**: Sessions and cookies are saved in `~/.config/agent-browser-linux/profiles/<name>`. Log into GitHub, Google, Twitter, AWS, or company portals once, and stay logged in forever.
+- **Visual Grounding & Annotated Badges**: Converts pages into interactive maps (`[@1]`, `[@2]`) and can render visual element badges directly onto screenshots with `--annotated`.
+- **Console & Network Observability**: Directly inspect runtime console errors (`agent-browser console`) and network requests (`agent-browser network`).
+- **File Automation**: First-class support for file uploads (`upload`) and file download handling (`download`).
 - **Zero-Latency CDP Attach**: Connects instantly via Chrome DevTools Protocol (CDP) in milliseconds without restarting the browser.
 
 ---
@@ -59,47 +61,25 @@ ln -sf ~/.gemini/config/skills/agent-browser-linux/bin/agent-browser.mjs ~/.loca
 | `type <text>` | Types raw text into the currently focused element | `agent-browser type "hello"` |
 | `press <Key>` | Presses a keyboard key (`Enter`, `Escape`, `Tab`, etc.) | `agent-browser press Enter` |
 | `scroll <dir> [px]` | Scrolls page (`down`, `up`, `top`, `bottom`) | `agent-browser scroll down 500` |
-| `screenshot [path]` | Saves a screenshot of the current page | `agent-browser screenshot /tmp/page.png` |
+| `screenshot [path] [--annotated]` | Captures screenshot with optional visual element badges | `agent-browser screenshot /tmp/shot.png --annotated` |
+| `console` | Inspects captured JavaScript errors and warnings | `agent-browser console` |
+| `network` | Lists active network requests and performance metrics | `agent-browser network` |
+| `upload <@id \| sel> <file>` | Uploads local file to `<input type="file">` | `agent-browser upload @4 /path/to/invoice.pdf` |
+| `download <@id \| sel> [dir]` | Clicks element and saves downloaded file | `agent-browser download @6 /tmp/downloads` |
+| `cookies [export \| import \| clear]` | Exports, imports, or clears session cookies | `agent-browser cookies export ./cookies.json` |
 | `text` | Extracts readable text of the page | `agent-browser text` |
 | `tabs` | Lists all open browser tabs | `agent-browser tabs` |
 | `new-tab [url]` | Opens a new browser tab | `agent-browser new-tab https://google.com` |
 | `close-tab [index]` | Closes active or specified tab | `agent-browser close-tab 1` |
-| `wait <sec \| sel>` | Waits for seconds or a CSS selector to appear | `agent-browser wait 3` |
+| `wait <sec \| sel \| networkidle>` | Waits for seconds, selector, or network idle state | `agent-browser wait networkidle` |
 | `eval "<javascript>"` | Evaluates JavaScript in the browser context | `agent-browser eval "document.title"` |
 | `stop` | Cleanly stops the browser process | `agent-browser stop` |
 
-*(Note: Both `agent-browser` and `agent-browser-linux` can be used interchangeably).*
-
----
-
-## Using with AI Agents (Antigravity, Claude Code, Cursor)
-
-Once installed, your agent will automatically recognize the `agent-browser-linux` skill. You can prompt naturally:
-
-### Example Prompts:
-- *"Using agent-browser, open my GitHub dashboard and check the latest pull requests."*
-- *"Navigate to https://news.ycombinator.com, find the top AI post, and summarize the comments."*
-- *"Open our staging environment, sign in, fill out the user creation form, and take a screenshot of the confirmation page."*
-
-### Agent Workflow Under the Hood:
-```
-User Prompt: "Check my notifications on GitHub"
-   │
-   ▼
-1. Agent runs: `agent-browser open https://github.com/notifications`
-   └─ Visible Chrome window opens on Linux desktop with saved session.
-   │
-2. Agent runs: `agent-browser snapshot`
-   └─ Receives numbered interactive elements:
-      [@1] Tab "Inbox"
-      [@2] Tab "Saved"
-      [@3] Link "PR #42: Add co-browsing support"
-   │
-3. Agent runs: `agent-browser click @3`
-   └─ Navigates to PR #42.
-   │
-4. Agent runs: `agent-browser text`
-   └─ Extracts discussion and reports findings to user.
+### Multi-Profile Support
+Isolate browser states, sessions, and cookies per persona or client using `--profile`:
+```bash
+agent-browser --profile personal open https://github.com
+agent-browser --profile work open https://internal.company.com
 ```
 
 ---
@@ -115,17 +95,18 @@ User Prompt: "Check my notifications on GitHub"
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │             Agent Browser CLI (Node.js)                │
-│     • Snapshot Engine   • Interactive Element Tagging  │
-│     • Session Manager   • Form & Navigation Dispatch   │
+│     • Visual Element Badging  • Shadow DOM Traversal   │
+│     • Console / Network Taps  • File Upload / Download │
+│     • Session / Cookie Store  • Multi-Profile Manager  │
 └───────────────────────────┬────────────────────────────┘
                             │ Chrome DevTools Protocol (CDP)
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │              Google Chrome (Linux GUI)                 │
 │   • Visible window (Wayland / X11)                     │
-│   • Persistent profile (~/.config/agent-browser-linux) │
+│   • Persistent profiles (~/.config/agent-browser-linux)│
 │   • User-in-the-loop (Logins, 2FA, CAPTCHA)            │
-└────────────────────────────────────────────────────────┘
+└───────────────────────────┘
 ```
 
 ---

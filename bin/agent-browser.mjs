@@ -1,14 +1,45 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { resolve, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { chromium } from 'playwright-core';
 
-const CDP_PORT = 9222;
+// Parse profile argument: --profile <name>
+function getProfileConfig() {
+  const args = process.argv.slice(2);
+  let profile = 'default';
+  const filteredArgs = [];
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--profile' && args[i + 1]) {
+      profile = args[i + 1];
+      i++;
+    } else if (args[i].startsWith('--profile=')) {
+      profile = args[i].split('=')[1];
+    } else {
+      filteredArgs.push(args[i]);
+    }
+  }
+
+  // Calculate distinct port for profile if not default
+  let port = 9222;
+  if (profile !== 'default') {
+    let hash = 0;
+    for (let i = 0; i < profile.length; i++) {
+      hash = (hash << 5) - hash + profile.charCodeAt(i);
+      hash |= 0;
+    }
+    port = 9230 + (Math.abs(hash) % 50);
+  }
+
+  const profileDir = resolve(homedir(), '.config/agent-browser-linux/profiles', profile);
+  return { profile, port, profileDir, args: filteredArgs };
+}
+
+const { profile: ACTIVE_PROFILE, port: CDP_PORT, profileDir: PROFILE_DIR, args: CLI_ARGS } = getProfileConfig();
 const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
-const PROFILE_DIR = resolve(homedir(), '.config/agent-browser-linux/profile');
 const SCREENSHOT_DEFAULT = '/tmp/agent-browser-screenshot.png';
 
 const CHROME_PATHS = [
@@ -48,8 +79,10 @@ async function ensureBrowser(headless = false) {
     `--user-data-dir=${PROFILE_DIR}`,
     '--no-first-run',
     '--no-default-browser-check',
-    '--enable-automation',
-    '--disable-blink-features=AutomationControlled'
+    '--start-maximized',
+    '--window-size=1440,900',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-infobars'
   ];
 
   if (headless) {
@@ -77,11 +110,46 @@ async function getBrowserSession() {
   const browser = await chromium.connectOverCDP(CDP_URL);
   const contexts = browser.contexts();
   const context = contexts[0] || (await browser.newContext());
+  
+  // Attach stealth & console capture init scripts
+  await context.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    } catch {}
+
+    if (!window.__agent_console_logs) {
+      window.__agent_console_logs = [];
+      const origErr = console.error;
+      const origWarn = console.warn;
+      console.error = (...args) => {
+        try {
+          window.__agent_console_logs.push({
+            type: 'error',
+            time: new Date().toISOString(),
+            message: args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+          });
+        } catch {}
+        origErr.apply(console, args);
+      };
+      console.warn = (...args) => {
+        try {
+          window.__agent_console_logs.push({
+            type: 'warn',
+            time: new Date().toISOString(),
+            message: args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+          });
+        } catch {}
+        origWarn.apply(console, args);
+      };
+    }
+  });
+
   const pages = context.pages();
   const page = pages[pages.length - 1] || (await context.newPage());
   return { browser, context, page };
 }
 
+// Interactive element extractor with Shadow DOM & recursive container support
 async function getInteractiveSnapshot(page, maxElements = 60) {
   return await page.evaluate((max) => {
     document.querySelectorAll('[data-agent-id]').forEach((el) => el.removeAttribute('data-agent-id'));
@@ -94,8 +162,9 @@ async function getInteractiveSnapshot(page, maxElements = 60) {
         rect.height > 0 &&
         style.visibility !== 'hidden' &&
         style.display !== 'none' &&
+        style.opacity !== '0' &&
         rect.bottom >= 0 &&
-        rect.top <= (window.innerHeight || document.documentElement.clientHeight) + 100
+        rect.top <= (window.innerHeight || document.documentElement.clientHeight) + 150
       );
     };
 
@@ -116,8 +185,22 @@ async function getInteractiveSnapshot(page, maxElements = 60) {
       '[tabindex="0"]'
     ].join(', ');
 
-    const all = Array.from(document.querySelectorAll(selector));
-    const visible = all.filter(isVisible);
+    // Collect interactive elements including Shadow DOM
+    function collectInteractive(root, list = []) {
+      const items = root.querySelectorAll ? Array.from(root.querySelectorAll(selector)) : [];
+      for (const el of items) {
+        if (isVisible(el)) list.push(el);
+      }
+      const all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+      for (const el of all) {
+        if (el.shadowRoot) {
+          collectInteractive(el.shadowRoot, list);
+        }
+      }
+      return list;
+    }
+
+    const visible = collectInteractive(document);
 
     const items = visible.slice(0, max).map((el, idx) => {
       const id = idx + 1;
@@ -146,6 +229,9 @@ async function getInteractiveSnapshot(page, maxElements = 60) {
         extra = ` (${type})`;
       }
 
+      if (el.disabled) extra += ' [disabled]';
+      if (el.checked) extra += ' [checked]';
+
       return {
         id,
         role,
@@ -163,11 +249,13 @@ async function getInteractiveSnapshot(page, maxElements = 60) {
   }, maxElements);
 }
 
+// Commands
 const commands = {
   async start(args) {
     const headless = args.includes('--headless');
     await ensureBrowser(headless);
-    console.log(`Browser started (${headless ? 'headless' : 'visible window'}). Profile: ${PROFILE_DIR}`);
+    console.log(`Browser started for profile "${ACTIVE_PROFILE}" (${headless ? 'headless' : 'maximized GUI'} on port ${CDP_PORT}).`);
+    console.log(`Profile directory: ${PROFILE_DIR}`);
   },
 
   async open(args) {
@@ -204,7 +292,7 @@ const commands = {
     }
   },
 
-  async text(args) {
+  async text() {
     const { browser, page } = await getBrowserSession();
     try {
       const content = await page.evaluate(() => {
@@ -312,11 +400,201 @@ const commands = {
   },
 
   async screenshot(args) {
-    const outPath = args[0] ? resolve(process.cwd(), args[0]) : SCREENSHOT_DEFAULT;
+    const isAnnotated = args.includes('--annotated');
+    const isFull = args.includes('--full');
+    const pathArg = args.find((a) => !a.startsWith('--'));
+    const outPath = pathArg ? resolve(process.cwd(), pathArg) : SCREENSHOT_DEFAULT;
+
     const { browser, page } = await getBrowserSession();
     try {
-      await page.screenshot({ path: outPath, fullPage: args.includes('--full') });
-      console.log(`Screenshot saved to: ${outPath}`);
+      if (isAnnotated) {
+        // Tag visible elements
+        await getInteractiveSnapshot(page, 80);
+        // Inject visual badges overlay
+        await page.evaluate(() => {
+          const container = document.createElement('div');
+          container.id = '__agent_annotated_overlay';
+          container.style.position = 'absolute';
+          container.style.top = '0';
+          container.style.left = '0';
+          container.style.width = '100%';
+          container.style.height = document.documentElement.scrollHeight + 'px';
+          container.style.pointerEvents = 'none';
+          container.style.zIndex = '2147483647';
+
+          document.querySelectorAll('[data-agent-id]').forEach((el) => {
+            const rect = el.getBoundingClientRect();
+            const id = el.getAttribute('data-agent-id');
+            const badge = document.createElement('div');
+            badge.innerText = id;
+            badge.style.position = 'absolute';
+            badge.style.left = `${rect.left + window.scrollX}px`;
+            badge.style.top = `${rect.top + window.scrollY}px`;
+            badge.style.background = '#2563eb';
+            badge.style.color = '#ffffff';
+            badge.style.fontSize = '12px';
+            badge.style.fontWeight = 'bold';
+            badge.style.padding = '1px 5px';
+            badge.style.borderRadius = '3px';
+            badge.style.border = '1px solid #ffffff';
+            badge.style.boxShadow = '0 2px 4px rgba(0,0,0,0.5)';
+            badge.style.lineHeight = '14px';
+
+            const box = document.createElement('div');
+            box.style.position = 'absolute';
+            box.style.left = `${rect.left + window.scrollX}px`;
+            box.style.top = `${rect.top + window.scrollY}px`;
+            box.style.width = `${rect.width}px`;
+            box.style.height = `${rect.height}px`;
+            box.style.border = '2px solid rgba(37, 99, 235, 0.7)';
+            box.style.boxSizing = 'border-box';
+
+            container.appendChild(box);
+            container.appendChild(badge);
+          });
+
+          document.body.appendChild(container);
+        });
+      }
+
+      await page.screenshot({ path: outPath, fullPage: isFull });
+
+      if (isAnnotated) {
+        await page.evaluate(() => {
+          document.getElementById('__agent_annotated_overlay')?.remove();
+        });
+      }
+
+      console.log(`Screenshot saved to: ${outPath} ${isAnnotated ? '(with visual element badges)' : ''}`);
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async upload(args) {
+    const target = args[0];
+    const filePath = args[1];
+    if (!target || !filePath) throw new Error('Usage: agent-browser upload <@id | selector> <filepath>');
+
+    const resolvedFile = resolve(process.cwd(), filePath);
+    if (!existsSync(resolvedFile)) {
+      throw new Error(`File not found: ${resolvedFile}`);
+    }
+
+    const { browser, page } = await getBrowserSession();
+    try {
+      const selector = target.startsWith('@') || /^\d+$/.test(target)
+        ? `[data-agent-id="${target.replace('@', '')}"]`
+        : target;
+
+      await page.setInputFiles(selector, resolvedFile);
+      console.log(`Uploaded "${resolvedFile}" to ${target}`);
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async download(args) {
+    const target = args[0];
+    const outDir = args[1] ? resolve(process.cwd(), args[1]) : '/tmp';
+    if (!target) throw new Error('Usage: agent-browser download <@id | selector> [outputDir]');
+
+    const { browser, page } = await getBrowserSession();
+    try {
+      const selector = target.startsWith('@') || /^\d+$/.test(target)
+        ? `[data-agent-id="${target.replace('@', '')}"]`
+        : target;
+
+      const [download] = await Promise.all([
+        page.waitForEvent('download', { timeout: 30000 }),
+        page.click(selector)
+      ]);
+
+      const suggestedName = download.suggestedFilename();
+      const savePath = resolve(outDir, suggestedName);
+      await download.saveAs(savePath);
+      console.log(`Downloaded file saved to: ${savePath}`);
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async console() {
+    const { browser, page } = await getBrowserSession();
+    try {
+      const logs = await page.evaluate(() => {
+        return window.__agent_console_logs || [];
+      });
+
+      console.log(`Console Logs (${logs.length} captured):`);
+      console.log('---------------------------------------------------------');
+      if (logs.length === 0) {
+        console.log('No console errors or warnings recorded on active page.');
+      } else {
+        for (const log of logs.slice(-25)) {
+          console.log(`[${log.type.toUpperCase()}] ${log.time.split('T')[1].slice(0, 8)}: ${log.message}`);
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async network() {
+    const { browser, page } = await getBrowserSession();
+    try {
+      const metrics = await page.evaluate(() => {
+        const entries = performance.getEntriesByType('resource');
+        return {
+          totalRequests: entries.length,
+          recent: entries.slice(-15).map((e) => ({
+            name: e.name.length > 70 ? e.name.slice(0, 70) + '...' : e.name,
+            initiatorType: e.initiatorType,
+            durationMs: Math.round(e.duration),
+            transferSize: e.transferSize || 0
+          }))
+        };
+      });
+
+      console.log(`Network Requests (${metrics.totalRequests} total resources on page):`);
+      console.log('---------------------------------------------------------');
+      for (const req of metrics.recent) {
+        console.log(`[${req.initiatorType.padEnd(7)}] ${req.name} (${req.durationMs}ms, ${Math.round(req.transferSize / 1024)}KB)`);
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async cookies(args) {
+    const action = args[0] || 'list';
+    const filePath = args[1];
+    const { browser, context } = await getBrowserSession();
+
+    try {
+      if (action === 'export') {
+        const targetPath = filePath ? resolve(process.cwd(), filePath) : resolve(homedir(), '.config/agent-browser-linux/cookies.json');
+        const cookieList = await context.cookies();
+        writeFileSync(targetPath, JSON.stringify(cookieList, null, 2), 'utf-8');
+        console.log(`Exported ${cookieList.length} cookies to: ${targetPath}`);
+      } else if (action === 'import') {
+        if (!filePath || !existsSync(resolve(process.cwd(), filePath))) {
+          throw new Error('Usage: agent-browser cookies import <file.json>');
+        }
+        const data = JSON.parse(readFileSync(resolve(process.cwd(), filePath), 'utf-8'));
+        await context.addCookies(data);
+        console.log(`Imported ${data.length} cookies successfully.`);
+      } else if (action === 'clear') {
+        await context.clearCookies();
+        console.log('Cleared all session and persistent cookies.');
+      } else {
+        const cookieList = await context.cookies();
+        console.log(`Cookies in profile "${ACTIVE_PROFILE}" (${cookieList.length}):`);
+        const domains = [...new Set(cookieList.map((c) => c.domain))];
+        for (const dom of domains.slice(0, 15)) {
+          console.log(` • Domain: ${dom} (${cookieList.filter((c) => c.domain === dom).length} cookies)`);
+        }
+      }
     } finally {
       await browser.close();
     }
@@ -369,10 +647,13 @@ const commands = {
 
   async wait(args) {
     const target = args[0];
-    if (!target) throw new Error('Usage: agent-browser wait <seconds | selector>');
+    if (!target) throw new Error('Usage: agent-browser wait <seconds | selector | networkidle>');
     const { browser, page } = await getBrowserSession();
     try {
-      if (/^\d+(\.\d+)?$/.test(target)) {
+      if (target === 'networkidle') {
+        await page.waitForLoadState('networkidle', { timeout: 15000 });
+        console.log('Network activity idle.');
+      } else if (/^\d+(\.\d+)?$/.test(target)) {
         const ms = parseFloat(target) * 1000;
         await page.waitForTimeout(ms);
         console.log(`Waited ${target}s`);
@@ -401,7 +682,7 @@ const commands = {
 
   async stop() {
     if (!(await isBrowserRunning())) {
-      console.log('Browser is not currently running.');
+      console.log(`Browser on port ${CDP_PORT} (profile "${ACTIVE_PROFILE}") is not running.`);
       return;
     }
     try {
@@ -409,7 +690,7 @@ const commands = {
       const session = await browser.newBrowserCDPSession();
       await session.send('Browser.close');
       await browser.close();
-      console.log('Browser stopped cleanly.');
+      console.log(`Browser stopped cleanly for profile "${ACTIVE_PROFILE}".`);
     } catch {
       console.log('Sent stop signal.');
     }
@@ -419,43 +700,48 @@ const commands = {
     console.log(`
 Agent Browser Linux — AI Agent & Human Co-Browsing for Linux
 
-Usage: agent-browser <command> [arguments...] (alias: agent-browser-linux)
+Usage: agent-browser [--profile <name>] <command> [arguments...] (alias: agent-browser-linux)
 
 Navigation:
-  open <url>                    Open URL in active tab
-  new-tab [url]                 Open a new tab
-  tabs                          List all open tabs
-  close-tab [index]             Close active or specific tab
+  open <url>                           Open URL in active tab
+  new-tab [url]                        Open a new tab
+  tabs                                 List all open tabs
+  close-tab [index]                    Close active or specific tab
 
-Inspection:
-  snapshot [limit]              Print interactive elements with [@1], [@2] IDs
-  text                          Extract readable text of current page
-  screenshot [path] [--full]    Take screenshot (default: /tmp/agent-browser-screenshot.png)
+Inspection & Vision:
+  snapshot [limit]                     Print interactive elements with [@1], [@2] IDs (with Shadow DOM support)
+  text                                 Extract readable text of current page
+  screenshot [path] [--annotated]      Capture screenshot (optional visual numbered element badges)
+  console                              Show captured console errors & warnings
+  network                              List active network requests and performance metrics
 
 Interaction:
-  click <@id | text | sel>      Click element by @id (from snapshot), text, or selector
-  fill <@id | sel> <text>       Fill form field / input
-  type <text>                   Type raw text into focused element
-  press <Key>                   Press keyboard key (Enter, Escape, Tab, etc.)
-  scroll <up|down|top|bottom>   Scroll page
-  wait <seconds | selector>     Wait for element or duration
-  eval "<javascript>"           Execute JavaScript on page
+  click <@id | text | sel>             Click element by @id (from snapshot), text, or selector
+  fill <@id | sel> <text>              Fill form field / input
+  type <text>                          Type raw text into focused element
+  press <Key>                          Press keyboard key (Enter, Escape, Tab, etc.)
+  scroll <up|down|top|bottom>          Scroll page
+  upload <@id | sel> <file>            Upload local file to file input
+  download <@id | sel> [dir]           Click element and wait for downloaded file
+  cookies [export|import|clear]        Export, import, or clear session cookies
+  wait <seconds | selector | networkidle> Wait for element, delay, or network idle
+  eval "<javascript>"                  Execute JavaScript on page
 
 Management:
-  start [--headless]            Launch browser instance (default is visible GUI)
-  stop                          Close browser instance
-  help                          Show this help message
+  start [--headless]                   Launch browser instance (default: maximized GUI)
+  stop                                 Close browser instance
+  help                                 Show this help message
 
-Data & Persistence:
-  Profile & Cookies saved to:   ~/.config/agent-browser-linux/profile
+Multi-Profile Support:
+  Pass --profile <name> before or after command to use isolated browser profiles:
+  agent-browser --profile work open https://internal.company.com
 `);
   }
 };
 
 async function main() {
-  const args = process.argv.slice(2);
-  const command = args[0] || 'help';
-  const cmdArgs = args.slice(1);
+  const command = CLI_ARGS[0] || 'help';
+  const cmdArgs = CLI_ARGS.slice(1);
 
   if (!commands[command]) {
     console.error(`Unknown command: "${command}". Run "agent-browser help" for available commands.`);
