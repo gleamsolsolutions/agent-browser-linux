@@ -1,0 +1,43 @@
+{
+  "name": "agent-browser-linux",
+  "version": "1.0.0",
+  "description": "AI Agent & Human Co-Browsing for Linux. Native Chrome automation, persistent profiles, and interactive element snapshots for AI agents.",
+  "type": "module",
+  "main": "bin/agent-browser.mjs",
+  "bin": {
+    "agent-browser": "./bin/agent-browser.mjs",
+    "agent-browser-linux": "./bin/agent-browser.mjs"
+  },
+  "scripts": {
+    "test": "node bin/agent-browser.mjs help"
+  },
+  "keywords": [
+    "ai-agent",
+    "agent-skill",
+    "antigravity",
+    "claude-code",
+    "cursor",
+    "browser-automation",
+    "co-browsing",
+    "linux",
+    "cdp",
+    "chrome",
+    "playwright"
+  ],
+  "author": "Gleamsol Solutions <contact@gleamsol.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gleamsolsolutions/agent-browser-linux.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gleamsolsolutions/agent-browser-linux/issues"
+  },
+  "homepage": "https://github.com/gleamsolsolutions/agent-browser-linux#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}
