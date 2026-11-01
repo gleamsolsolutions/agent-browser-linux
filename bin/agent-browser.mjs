@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
+import readline from 'node:readline';
 import { chromium } from 'playwright-core';
 
 // Parse profile argument: --profile <name>
@@ -23,7 +24,6 @@ function getProfileConfig() {
     }
   }
 
-  // Calculate distinct port for profile if not default
   let port = 9222;
   if (profile !== 'default') {
     let hash = 0;
@@ -80,9 +80,7 @@ async function ensureBrowser(headless = false) {
     '--no-first-run',
     '--no-default-browser-check',
     '--start-maximized',
-    '--window-size=1440,900',
-    '--disable-blink-features=AutomationControlled',
-    '--disable-infobars'
+    '--window-size=1440,900'
   ];
 
   if (headless) {
@@ -110,7 +108,7 @@ async function getBrowserSession() {
   const browser = await chromium.connectOverCDP(CDP_URL);
   const contexts = browser.contexts();
   const context = contexts[0] || (await browser.newContext());
-  
+
   // Attach stealth & console capture init scripts
   await context.addInitScript(() => {
     try {
@@ -149,7 +147,7 @@ async function getBrowserSession() {
   return { browser, context, page };
 }
 
-// Interactive element extractor with Shadow DOM & recursive container support
+// Flat interactive element snapshot
 async function getInteractiveSnapshot(page, maxElements = 60) {
   return await page.evaluate((max) => {
     document.querySelectorAll('[data-agent-id]').forEach((el) => el.removeAttribute('data-agent-id'));
@@ -185,7 +183,6 @@ async function getInteractiveSnapshot(page, maxElements = 60) {
       '[tabindex="0"]'
     ].join(', ');
 
-    // Collect interactive elements including Shadow DOM
     function collectInteractive(root, list = []) {
       const items = root.querySelectorAll ? Array.from(root.querySelectorAll(selector)) : [];
       for (const el of items) {
@@ -249,7 +246,120 @@ async function getInteractiveSnapshot(page, maxElements = 60) {
   }, maxElements);
 }
 
-// Commands
+// Hierarchical ARIA tree snapshot
+async function getHierarchicalTreeSnapshot(page, maxElements = 80) {
+  return await page.evaluate((max) => {
+    document.querySelectorAll('[data-agent-id]').forEach((el) => el.removeAttribute('data-agent-id'));
+
+    let currentId = 0;
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        rect.bottom >= 0 &&
+        rect.top <= (window.innerHeight || document.documentElement.clientHeight) + 200
+      );
+    };
+
+    const isInteractive = (el) => {
+      const tag = el.tagName.toLowerCase();
+      const role = el.getAttribute('role') || '';
+      return (
+        (tag === 'a' && el.hasAttribute('href')) ||
+        tag === 'button' ||
+        (tag === 'input' && el.type !== 'hidden') ||
+        tag === 'textarea' ||
+        tag === 'select' ||
+        ['button', 'link', 'checkbox', 'radio', 'tab', 'menuitem', 'textbox'].includes(role) ||
+        el.getAttribute('contenteditable') === 'true'
+      );
+    };
+
+    const isLandmark = (el) => {
+      const tag = el.tagName.toLowerCase();
+      const role = el.getAttribute('role') || '';
+      return (
+        ['header', 'nav', 'main', 'section', 'article', 'form', 'footer', 'aside'].includes(tag) ||
+        ['banner', 'navigation', 'main', 'complementary', 'contentinfo', 'form'].includes(role) ||
+        tag.startsWith('h')
+      );
+    };
+
+    const lines = [];
+
+    function walk(node, depth = 0) {
+      if (!node || currentId >= max) return;
+      const indent = '  '.repeat(depth);
+
+      for (const child of Array.from(node.children || [])) {
+        if (!isVisible(child)) continue;
+
+        if (isInteractive(child)) {
+          currentId++;
+          child.setAttribute('data-agent-id', String(currentId));
+          const tag = child.tagName.toLowerCase();
+          const role = child.getAttribute('role') || tag;
+          const text = (
+            child.getAttribute('aria-label') ||
+            child.getAttribute('placeholder') ||
+            child.getAttribute('title') ||
+            child.innerText ||
+            child.value ||
+            ''
+          )
+            .trim()
+            .replace(/\s+/g, ' ')
+            .slice(0, 60);
+
+          let href = '';
+          if (tag === 'a' && child.getAttribute('href')) {
+            const h = child.getAttribute('href');
+            href = ` [${h.length > 40 ? h.slice(0, 40) + '...' : h}]`;
+          }
+          lines.push(`${indent}[@${currentId}] <${role}> ${text ? `"${text}"` : '(unlabeled)'}${href}`);
+        } else if (isLandmark(child)) {
+          const tag = child.tagName.toLowerCase();
+          let label = child.getAttribute('aria-label') || '';
+          if (tag.startsWith('h') && /^h[1-6]$/.test(tag)) {
+            const headingText = (child.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 50);
+            lines.push(`${indent}<${tag}> "${headingText}"`);
+          } else {
+            lines.push(`${indent}[${tag}${label ? ` "${label}"` : ''}]`);
+            walk(child, depth + 1);
+          }
+        } else {
+          walk(child, depth);
+        }
+      }
+    }
+
+    walk(document.body, 0);
+
+    return {
+      title: document.title,
+      url: window.location.href,
+      totalElements: currentId,
+      tree: lines.join('\n')
+    };
+  }, maxElements);
+}
+
+// Device presets
+const DEVICE_PRESETS = {
+  mobile: { width: 390, height: 844, name: 'Standard Mobile (iPhone 14/15)' },
+  iphone: { width: 393, height: 852, name: 'Apple iPhone 15 Pro' },
+  pixel: { width: 412, height: 915, name: 'Google Pixel 8' },
+  tablet: { width: 820, height: 1180, name: 'Apple iPad Air' },
+  ipad: { width: 820, height: 1180, name: 'Apple iPad Air' },
+  desktop: { width: 1440, height: 900, name: 'Standard Desktop (1440x900)' },
+  fhd: { width: 1920, height: 1080, name: 'Full HD Desktop (1920x1080)' }
+};
+
+// Core Commands
 const commands = {
   async start(args) {
     const headless = args.includes('--headless');
@@ -273,19 +383,31 @@ const commands = {
   },
 
   async snapshot(args) {
-    const limit = parseInt(args[0], 10) || 50;
+    const isTree = args.includes('--tree');
+    const limitArg = args.find((a) => !a.startsWith('--'));
+    const limit = parseInt(limitArg, 10) || 60;
     const { browser, page } = await getBrowserSession();
+
     try {
-      const snap = await getInteractiveSnapshot(page, limit);
-      console.log(`Title: ${snap.title}`);
-      console.log(`URL:   ${snap.url}`);
-      console.log(`\nInteractive Elements (${snap.items.length} visible of ${snap.totalFound}):`);
-      console.log('---------------------------------------------------------');
-      for (const item of snap.items) {
-        console.log(`[@${item.id}] <${item.role}> ${item.label ? `"${item.label}"` : '(unlabeled)'}${item.extra}`);
-      }
-      if (snap.totalFound > snap.items.length) {
-        console.log(`... and ${snap.totalFound - snap.items.length} more elements. Use scroll or agent-browser snapshot 100.`);
+      if (isTree) {
+        const snap = await getHierarchicalTreeSnapshot(page, limit);
+        console.log(`Title: ${snap.title}`);
+        console.log(`URL:   ${snap.url}`);
+        console.log(`\nHierarchical Accessibility Tree (${snap.totalElements} interactive elements):`);
+        console.log('---------------------------------------------------------');
+        console.log(snap.tree);
+      } else {
+        const snap = await getInteractiveSnapshot(page, limit);
+        console.log(`Title: ${snap.title}`);
+        console.log(`URL:   ${snap.url}`);
+        console.log(`\nInteractive Elements (${snap.items.length} visible of ${snap.totalFound}):`);
+        console.log('---------------------------------------------------------');
+        for (const item of snap.items) {
+          console.log(`[@${item.id}] <${item.role}> ${item.label ? `"${item.label}"` : '(unlabeled)'}${item.extra}`);
+        }
+        if (snap.totalFound > snap.items.length) {
+          console.log(`... and ${snap.totalFound - snap.items.length} more elements. Use scroll or agent-browser snapshot 100.`);
+        }
       }
     } finally {
       await browser.close();
@@ -351,6 +473,75 @@ const commands = {
     }
   },
 
+  async autofill(args) {
+    const jsonStr = args.join(' ');
+    if (!jsonStr) throw new Error('Usage: agent-browser autofill \'{"fieldName": "value", ...}\'');
+
+    let formData;
+    try {
+      formData = JSON.parse(jsonStr);
+    } catch {
+      throw new Error('Invalid JSON provided to autofill.');
+    }
+
+    const { browser, page } = await getBrowserSession();
+    try {
+      const result = await page.evaluate((data) => {
+        const filled = [];
+        const inputs = Array.from(
+          document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select')
+        );
+
+        for (const [key, val] of Object.entries(data)) {
+          const lowerKey = key.toLowerCase();
+          const target = inputs.find((el) => {
+            const name = (el.name || '').toLowerCase();
+            const id = (el.id || '').toLowerCase();
+            const placeholder = (el.placeholder || '').toLowerCase();
+            const autocomplete = (el.autocomplete || '').toLowerCase();
+            const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+
+            let labelText = '';
+            if (el.id) {
+              const labelEl = document.querySelector(`label[for="${el.id}"]`);
+              if (labelEl) labelText = labelEl.innerText.toLowerCase();
+            }
+
+            return (
+              name.includes(lowerKey) ||
+              id.includes(lowerKey) ||
+              placeholder.includes(lowerKey) ||
+              autocomplete.includes(lowerKey) ||
+              ariaLabel.includes(lowerKey) ||
+              labelText.includes(lowerKey)
+            );
+          });
+
+          if (target) {
+            target.focus();
+            if (target.tagName.toLowerCase() === 'select') {
+              target.value = String(val);
+            } else {
+              target.value = String(val);
+            }
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            filled.push({ key, id: target.id || target.name || target.tagName });
+          }
+        }
+
+        return { count: filled.length, filled };
+      }, formData);
+
+      console.log(`AutoFill completed: ${result.count} fields populated.`);
+      for (const f of result.filled) {
+        console.log(` - Matched "${f.key}" -> <#${f.id}>`);
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+
   async type(args) {
     const text = args.join(' ');
     if (!text) throw new Error('Usage: agent-browser type <text>');
@@ -408,9 +599,7 @@ const commands = {
     const { browser, page } = await getBrowserSession();
     try {
       if (isAnnotated) {
-        // Tag visible elements
         await getInteractiveSnapshot(page, 80);
-        // Inject visual badges overlay
         await page.evaluate(() => {
           const container = document.createElement('div');
           container.id = '__agent_annotated_overlay';
@@ -466,6 +655,116 @@ const commands = {
       }
 
       console.log(`Screenshot saved to: ${outPath} ${isAnnotated ? '(with visual element badges)' : ''}`);
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async device(args) {
+    const target = (args[0] || '').toLowerCase();
+    if (!target || !DEVICE_PRESETS[target]) {
+      const options = Object.keys(DEVICE_PRESETS).join(', ');
+      throw new Error(`Usage: agent-browser device <${options}>`);
+    }
+
+    const preset = DEVICE_PRESETS[target];
+    const { browser, page } = await getBrowserSession();
+    try {
+      await page.setViewportSize({ width: preset.width, height: preset.height });
+      console.log(`Device viewport set to ${preset.name} (${preset.width}x${preset.height}px).`);
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async pdf(args) {
+    const outPath = args[0] ? resolve(process.cwd(), args[0]) : '/tmp/agent-browser-document.pdf';
+    const { browser, context, page } = await getBrowserSession();
+    try {
+      const pageSession = await context.newCDPSession(page);
+      const pdfData = await pageSession.send('Page.printToPDF', {
+        printBackground: true,
+        preferCSSPageSize: true
+      });
+      const buffer = Buffer.from(pdfData.data, 'base64');
+      writeFileSync(outPath, buffer);
+      console.log(`PDF saved successfully to: ${outPath} (${Math.round(buffer.length / 1024)} KB)`);
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async storage(args) {
+    const action = args[0] || 'dump';
+    const key = args[1];
+    const val = args.slice(2).join(' ');
+    const { browser, page } = await getBrowserSession();
+
+    try {
+      if (action === 'get') {
+        if (!key) throw new Error('Usage: agent-browser storage get <key>');
+        const res = await page.evaluate((k) => {
+          return { local: localStorage.getItem(k), session: sessionStorage.getItem(k) };
+        }, key);
+        console.log(`Key "${key}":`);
+        console.log(` • localStorage:   ${res.local}`);
+        console.log(` • sessionStorage: ${res.session}`);
+      } else if (action === 'set') {
+        if (!key) throw new Error('Usage: agent-browser storage set <key> <value>');
+        await page.evaluate(({ k, v }) => {
+          localStorage.setItem(k, v);
+        }, { k: key, v: val });
+        console.log(`Set localStorage["${key}"] = "${val}"`);
+      } else if (action === 'clear') {
+        await page.evaluate(() => {
+          localStorage.clear();
+          sessionStorage.clear();
+        });
+        console.log('Cleared both localStorage and sessionStorage.');
+      } else {
+        const dump = await page.evaluate(() => {
+          const local = {};
+          const session = {};
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            local[k] = localStorage.getItem(k);
+          }
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const k = sessionStorage.key(i);
+            session[k] = sessionStorage.getItem(k);
+          }
+          return { local, session };
+        });
+
+        console.log(`LocalStorage (${Object.keys(dump.local).length} entries):`);
+        console.log(JSON.stringify(dump.local, null, 2));
+        console.log(`\nSessionStorage (${Object.keys(dump.session).length} entries):`);
+        console.log(JSON.stringify(dump.session, null, 2));
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+
+  async 'wait-nav'(args) {
+    const pattern = args[0];
+    const timeoutSec = parseInt(args[1], 10) || 60;
+    const { browser, page } = await getBrowserSession();
+
+    console.log(`Waiting for navigation ${pattern ? `matching "${pattern}"` : 'event'} (up to ${timeoutSec}s)...`);
+    const start = Date.now();
+    try {
+      while ((Date.now() - start) < timeoutSec * 1000) {
+        const currentUrl = page.url();
+        if (pattern) {
+          if (currentUrl.includes(pattern)) {
+            console.log(`Navigation reached: ${currentUrl}`);
+            return;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      console.log(`Wait-nav finished. Current URL: ${page.url()}`);
     } finally {
       await browser.close();
     }
@@ -696,6 +995,295 @@ const commands = {
     }
   },
 
+  // Built-in Model Context Protocol (MCP) Server Mode over stdio
+  async mcp() {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: false
+    });
+
+    const sendResponse = (id, result, error = null) => {
+      const res = { jsonrpc: '2.0', id };
+      if (error) {
+        res.error = error;
+      } else {
+        res.result = result;
+      }
+      process.stdout.write(JSON.stringify(res) + '\n');
+    };
+
+    const tools = [
+      {
+        name: 'browser_open',
+        description: 'Open a URL in the browser',
+        inputSchema: {
+          type: 'object',
+          properties: { url: { type: 'string', description: 'URL to navigate to' } },
+          required: ['url']
+        }
+      },
+      {
+        name: 'browser_snapshot',
+        description: 'Get interactive numbered element tags or hierarchical tree from active page',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tree: { type: 'boolean', description: 'Return hierarchical ARIA accessibility tree instead of flat list' },
+            limit: { type: 'number', description: 'Maximum elements to return' }
+          }
+        }
+      },
+      {
+        name: 'browser_click',
+        description: 'Click an element by @id from snapshot, text, or CSS selector',
+        inputSchema: {
+          type: 'object',
+          properties: { target: { type: 'string', description: '@id, text, or CSS selector' } },
+          required: ['target']
+        }
+      },
+      {
+        name: 'browser_fill',
+        description: 'Fill an input or textarea',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            target: { type: 'string', description: '@id or CSS selector' },
+            text: { type: 'string', description: 'Text to fill' }
+          },
+          required: ['target', 'text']
+        }
+      },
+      {
+        name: 'browser_autofill',
+        description: 'Automatically match and populate multiple form fields simultaneously',
+        inputSchema: {
+          type: 'object',
+          properties: { fields: { type: 'object', description: 'Key-value map of form field names and values' } },
+          required: ['fields']
+        }
+      },
+      {
+        name: 'browser_screenshot',
+        description: 'Take screenshot of current page',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path to save screenshot' },
+            annotated: { type: 'boolean', description: 'Overlay visual numbered element badges on screenshot' }
+          }
+        }
+      },
+      {
+        name: 'browser_pdf',
+        description: 'Print current page to vectorized PDF document',
+        inputSchema: {
+          type: 'object',
+          properties: { path: { type: 'string', description: 'Path to save output PDF' } },
+          required: ['path']
+        }
+      },
+      {
+        name: 'browser_device',
+        description: 'Switch responsive device viewport (mobile, tablet, desktop, iphone, pixel)',
+        inputSchema: {
+          type: 'object',
+          properties: { device: { type: 'string', description: 'mobile, tablet, desktop, iphone, pixel' } },
+          required: ['device']
+        }
+      },
+      {
+        name: 'browser_console',
+        description: 'Inspect captured console errors and warnings',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'browser_network',
+        description: 'Inspect recent network resources and performance metrics',
+        inputSchema: { type: 'object', properties: {} }
+      },
+      {
+        name: 'browser_eval',
+        description: 'Evaluate JavaScript in active page context',
+        inputSchema: {
+          type: 'object',
+          properties: { code: { type: 'string', description: 'JavaScript code to execute' } },
+          required: ['code']
+        }
+      }
+    ];
+
+    rl.on('line', async (line) => {
+      if (!line.trim()) return;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      const { id, method, params } = msg;
+
+      if (method === 'initialize') {
+        sendResponse(id, {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'agent-browser-linux', version: '1.2.0' }
+        });
+      } else if (method === 'notifications/initialized') {
+        // Notification ack
+      } else if (method === 'tools/list') {
+        sendResponse(id, { tools });
+      } else if (method === 'tools/call') {
+        const { name, arguments: toolArgs = {} } = params || {};
+        try {
+          let outputText = '';
+          if (name === 'browser_open') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              await page.goto(toolArgs.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              outputText = `Navigated to: ${page.url()}\nTitle: ${await page.title()}`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_snapshot') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              if (toolArgs.tree) {
+                const snap = await getHierarchicalTreeSnapshot(page, toolArgs.limit || 80);
+                outputText = `Title: ${snap.title}\nURL: ${snap.url}\n\nHierarchical Tree:\n${snap.tree}`;
+              } else {
+                const snap = await getInteractiveSnapshot(page, toolArgs.limit || 60);
+                outputText = `Title: ${snap.title}\nURL: ${snap.url}\n\nElements:\n` +
+                  snap.items.map((i) => `[@${i.id}] <${i.role}> "${i.label}"${i.extra}`).join('\n');
+              }
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_click') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              const target = toolArgs.target;
+              if (target.startsWith('@') || /^\d+$/.test(target)) {
+                await page.click(`[data-agent-id="${target.replace('@', '')}"]`, { timeout: 10000 });
+              } else {
+                await page.click(target, { timeout: 6000 });
+              }
+              await page.waitForTimeout(400);
+              outputText = `Clicked ${target}. Active URL: ${page.url()}`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_fill') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              const target = toolArgs.target;
+              const sel = target.startsWith('@') || /^\d+$/.test(target)
+                ? `[data-agent-id="${target.replace('@', '')}"]`
+                : target;
+              await page.fill(sel, toolArgs.text, { timeout: 10000 });
+              outputText = `Filled ${target} with "${toolArgs.text}"`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_autofill') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              const res = await page.evaluate((data) => {
+                const inputs = Array.from(document.querySelectorAll('input, textarea, select'));
+                let count = 0;
+                for (const [k, v] of Object.entries(data)) {
+                  const target = inputs.find((el) =>
+                    (el.name || '').toLowerCase().includes(k.toLowerCase()) ||
+                    (el.id || '').toLowerCase().includes(k.toLowerCase()) ||
+                    (el.placeholder || '').toLowerCase().includes(k.toLowerCase())
+                  );
+                  if (target) {
+                    target.value = String(v);
+                    target.dispatchEvent(new Event('input', { bubbles: true }));
+                    target.dispatchEvent(new Event('change', { bubbles: true }));
+                    count++;
+                  }
+                }
+                return count;
+              }, toolArgs.fields || {});
+              outputText = `AutoFill populated ${res} form fields.`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_screenshot') {
+            const out = toolArgs.path || SCREENSHOT_DEFAULT;
+            const { browser, page } = await getBrowserSession();
+            try {
+              await page.screenshot({ path: out, fullPage: false });
+              outputText = `Screenshot saved to: ${out}`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_pdf') {
+            const out = toolArgs.path || '/tmp/agent-browser-document.pdf';
+            const { browser, context, page } = await getBrowserSession();
+            try {
+              const pageSession = await context.newCDPSession(page);
+              const pdf = await pageSession.send('Page.printToPDF', { printBackground: true });
+              writeFileSync(out, Buffer.from(pdf.data, 'base64'));
+              outputText = `PDF exported to: ${out}`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_device') {
+            const p = DEVICE_PRESETS[toolArgs.device] || DEVICE_PRESETS.mobile;
+            const { browser, page } = await getBrowserSession();
+            try {
+              await page.setViewportSize({ width: p.width, height: p.height });
+              outputText = `Viewport set to ${p.name} (${p.width}x${p.height}px)`;
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_console') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              const logs = await page.evaluate(() => window.__agent_console_logs || []);
+              outputText = `Captured ${logs.length} console logs:\n` +
+                logs.map((l) => `[${l.type}] ${l.message}`).join('\n');
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_network') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              const entries = await page.evaluate(() => performance.getEntriesByType('resource').slice(-10));
+              outputText = `Recent network requests:\n` +
+                entries.map((e) => `[${e.initiatorType}] ${e.name.slice(0, 70)} (${Math.round(e.duration)}ms)`).join('\n');
+            } finally {
+              await browser.close();
+            }
+          } else if (name === 'browser_eval') {
+            const { browser, page } = await getBrowserSession();
+            try {
+              const res = await page.evaluate((code) => window.eval(code), toolArgs.code);
+              outputText = `Result: ${typeof res === 'object' ? JSON.stringify(res) : String(res)}`;
+            } finally {
+              await browser.close();
+            }
+          } else {
+            throw new Error(`Unknown tool: ${name}`);
+          }
+
+          sendResponse(id, { content: [{ type: 'text', text: outputText }] });
+        } catch (err) {
+          sendResponse(id, null, { code: -32603, message: err.message });
+        }
+      } else {
+        sendResponse(id, null, { code: -32601, message: `Method not found: ${method}` });
+      }
+    });
+
+    // Keep process alive while stdin is open
+    await new Promise((resolve) => rl.on('close', resolve));
+  },
+
   async help() {
     console.log(`
 Agent Browser Linux — AI Agent & Human Co-Browsing for Linux
@@ -707,25 +1295,33 @@ Navigation:
   new-tab [url]                        Open a new tab
   tabs                                 List all open tabs
   close-tab [index]                    Close active or specific tab
+  wait-nav [urlPattern] [timeoutSec]   Wait for user or page to navigate to target URL
 
 Inspection & Vision:
-  snapshot [limit]                     Print interactive elements with [@1], [@2] IDs (with Shadow DOM support)
+  snapshot [--tree] [limit]            Interactive elements: flat [@1], [@2] or hierarchical --tree
   text                                 Extract readable text of current page
   screenshot [path] [--annotated]      Capture screenshot (optional visual numbered element badges)
+  pdf [path]                           Print current page to vectorized PDF document
   console                              Show captured console errors & warnings
   network                              List active network requests and performance metrics
+  storage [get|set|clear|dump]         Inspect or modify localStorage & sessionStorage
 
-Interaction:
+Interaction & Forms:
   click <@id | text | sel>             Click element by @id (from snapshot), text, or selector
   fill <@id | sel> <text>              Fill form field / input
+  autofill '<json-data>'               Batch auto-fill multiple form fields simultaneously
   type <text>                          Type raw text into focused element
   press <Key>                          Press keyboard key (Enter, Escape, Tab, etc.)
   scroll <up|down|top|bottom>          Scroll page
   upload <@id | sel> <file>            Upload local file to file input
   download <@id | sel> [dir]           Click element and wait for downloaded file
   cookies [export|import|clear]        Export, import, or clear session cookies
+  device <mobile|tablet|desktop|iphone> Dynamically switch responsive device viewport
   wait <seconds | selector | networkidle> Wait for element, delay, or network idle
   eval "<javascript>"                  Execute JavaScript on page
+
+Server Mode:
+  mcp                                  Start Model Context Protocol (MCP) JSON-RPC server over stdio
 
 Management:
   start [--headless]                   Launch browser instance (default: maximized GUI)

@@ -1,6 +1,6 @@
 {
   "name": "agent-browser-linux",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "AI Agent & Human Co-Browsing for Linux. Native Chrome automation, persistent profiles, and interactive element snapshots for AI agents.",
   "type": "module",
   "main": "bin/agent-browser.mjs",
